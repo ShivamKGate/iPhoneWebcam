@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, initial-scale=1">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>iPhone Webcam Streamer</title>
+  <style>
+    body { 
+      text-align: center; 
+      font-family: -apple-system, system-ui, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      margin: 0;
+      padding: 16px;
+      background: #f5f5f7;
+      min-height: 100vh;
+    }
+    video { 
+      width: 90vw; 
+      max-width: 480px; 
+      border: 2px solid #333; 
+      border-radius: 12px;
+      margin-top: 16px;
+      background: #000;
+    }
+    button { 
+      margin-top: 16px; 
+      padding: 12px 24px; 
+      font-size: 1.2em;
+      border-radius: 8px;
+      border: none;
+      background: #007AFF;
+      color: white;
+      font-weight: 500;
+      -webkit-appearance: none;
+      appearance: none;
+    }
+    select { 
+      margin: 8px;
+      padding: 8px 12px;
+      font-size: 1em;
+      border: 1px solid #ccc;
+      background: white;
+      -webkit-appearance: none;
+      appearance: none;
+    }
+    .status-box {
+      margin-top: 16px;
+      margin-top: 16px;
+      padding: 12px;
+      border-radius: 8px;
+      background: white;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    #status, #fpsDisplay {
+      margin: 8px 0;
+      font-size: 0.9em;
+      color: #666;
+    }
+    select { margin: 5px; padding: 5px; }
+  </style>
+<body>
+  <h2>iPhone Webcam Streamer</h2>
+  <video id="video" autoplay></video><br>
+  <label for="camera">Camera:</label>
+  <select id="camera">
+    <option value="">Loading cameras...</option>
+  </select>
+  <br>
+  <label for="resolution">Resolution:</label>
+  <select id="resolution">
+    <option value="3840x2160">3840x2160 (4K)</option>
+    <option value="960x540">960x540</option>
+  </select>
+  <button id="start" type="button">Start Streaming</button>
+  <p id="status"></p>
+  <p id="fpsDisplay"></p>
+  <script>
+    const video = document.getElementById('video');
+    const startBtn = document.getElementById('start');
+    const status = document.getElementById('status');
+    const resolutionSelect = document.getElementById('resolution');
+    const cameraSelect = document.getElementById('camera');
+    const fpsDisplay = document.getElementById('fpsDisplay');
+    let streaming = false;
+    let cameraStarted = false;
+    let uploading = false;
+    let lastFrameTime = 0;
+    let frameCount = 0;
+    let fpsTimer = null;    
+    let currentWidth = 1280;
+    let currentHeight = 720;
+    let useWebP = false;
+    let wakeLock = null;
+    let reconnectTimer = null;
+    let streamReconnectAttempts = 0;
+    const MAX_RECONNECT_ATTEMPTS = 5;
+
+    // iOS 18+ specific checks
+    async function checkIOSPermissions() {
+        try {
+            // Check if running on iOS
+            const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+            if (!isIOS) return true;
+
+            // Request permissions explicitly
+            const permitted = await Promise.all([
+                navigator.permissions.query({ name: 'camera' }),
+                navigator.permissions.query({ name: 'microphone' })
+            ]);
+
+            if (permitted.some(p => p.state === 'denied')) {
+                status.textContent = 'Camera access denied. Please enable camera access in Settings > Safari > Camera';
+                return false;
+            }
+
+            return true;
+        } catch (err) {
+            console.log('Permission check error:', err);
+            return true; // Continue anyway as permission API might not be available
+        }
+    }
+
+    // Modern iOS device checks
+    async function checkDeviceSupport() {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ 
+                video: { 
+                    facingMode: 'environment',
+                    width: { ideal: 1280 },
+                    height: { ideal: 720 }
+                } 
+            });
+            stream.getTracks().forEach(track => track.stop());
+            return true;
+        } catch (err) {
+            status.textContent = `Camera error: ${err.message}. Please check camera permissions in Settings.`;
+            return false;
+        }
+    }
+
+    // Function to keep screen awake
+    async function requestWakeLock() {
+        try {
+            if ('wakeLock' in navigator) {
+                wakeLock = await navigator.wakeLock.request('screen');
+                console.log('Wake Lock is active');
+                wakeLock.addEventListener('release', () => {
+                    console.log('Wake Lock was released');
+                    if (streaming) {
+                        // Try to reacquire wake lock if we're still streaming
+                        requestWakeLock();
+                    }
+                });
+            } else {
+                console.log('Wake Lock API not supported');
+            }
+        } catch (err) {
+            console.error(`${err.name}, ${err.message}`);
+        }
+    }
+
+    // Function to release wake lock
+    async function releaseWakeLock() {
+        if (wakeLock) {
+            try {
+                await wakeLock.release();
+                wakeLock = null;
+            } catch (err) {
+                console.error(`${err.name}, ${err.message}`);
+            }
+        }
+    }
+
+    // Handle visibility change
+    document.addEventListener('visibilitychange', async () => {
+        if (streaming) {
+            if (document.visibilityState === 'visible') {
+                await requestWakeLock();
+                if (!cameraStarted) {
+                    await startCamera();
+                }
+            }
+        }
+    });
+
+    // Automatically get the server URL from the current page
+    const SERVER_URL = window.location.href.replace(/\/$/, '') + '/upload';
+
+    // Get available cameras
+    async function getCameras() {
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const cameras = devices.filter(device => device.kind === 'videoinput');
+        cameraSelect.innerHTML = cameras.map(camera => 
+          `<option value="${camera.deviceId}">${camera.label || `Camera ${cameras.indexOf(camera) + 1}`}</option>`
+        ).join('');
+      } catch (err) {
+        console.error('Error getting cameras:', err);
+        status.textContent = 'Error loading cameras';
+      }
+    }
+
+    // Request camera permission to get labels
+    navigator.mediaDevices.getUserMedia({ video: true })
+      .then(stream => {
+        stream.getTracks().forEach(track => track.stop());
+        getCameras();
+      })
+      .catch(() => {
+        status.textContent = 'Camera permission denied';
+      });
+
+    async function checkWebPSupport() {
+      // Test if WebP is supported by the browser
+      return new Promise(resolve => {
+        const img = new Image();
+        img.onload = () => resolve(img.width === 1);
+        img.onerror = () => resolve(false);
+        img.src = "data:image/webp;base64,UklGRiIAAABXRUJQVlA4TAYAAAAvAAAAAAfQ//73v/+BiOh/AAA=";
+      });
+    }
+    
+    async function startCamera() {
+      try {
+        // Check iOS permissions first
+        const permissionsGranted = await checkIOSPermissions();
+        if (!permissionsGranted) {
+          return;
+        }
+
+        // Verify device support
+        const deviceSupported = await checkDeviceSupport();
+        if (!deviceSupported) {
+          return;
+        }
+
+        const [w, h] = resolutionSelect.value.split('x').map(Number);
+        currentWidth = w;
+        currentHeight = h;
+
+        // iOS 18.5 specific constraints
+        const constraints = {
+          video: {
+            width: { ideal: w },
+            height: { ideal: h },
+            frameRate: { ideal: 30 }
+          },
+          audio: false
+        };
+
+        // Add deviceId if specified
+        if (cameraSelect.value) {
+          constraints.video.deviceId = { exact: cameraSelect.value };
+        }
+
+        // Request the stream with specific iOS hints
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        
+        // For iOS, we need to wait a moment for the camera to initialize
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+        video.srcObject = stream;
+        video.play().catch(e => console.error('Video play error:', e));
+        
+        cameraStarted = true;
+        status.textContent = `Camera started at ${w}x${h}. Ready to stream.`;
+
+        // iOS specific: request full-screen for better performance
+        if (video.webkitEnterFullscreen) {
+          video.webkitEnterFullscreen();
+        }
+      } catch (err) {
+        console.error('Camera error:', err);
+        status.textContent = `Camera error: ${err.message}. Please check camera permissions in Settings > Safari > Camera`;
+        
+        // Show more detailed error for iOS users
+        if (/iPad|iPhone|iPod/.test(navigator.userAgent)) {
+          status.textContent += '\n\nOn iOS, make sure to:\n1. Allow camera access in Safari settings\n2. Enable camera access for this website\n3. Reload the page';
+        }
+      }
+    }
+
+    async function sendFrame() {
+      if (!streaming || !cameraStarted || uploading) return;
+      if (video.videoWidth === 0 || video.videoHeight === 0) {
+        status.textContent = 'Waiting for camera...';
+        setTimeout(sendFrame, 100);
+        return;
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = currentWidth;
+      canvas.height = currentHeight;
+      const ctx = canvas.getContext('2d');
+      // If the video is portrait (height > width), rotate to landscape
+      if (video.videoHeight > video.videoWidth) {
+        ctx.save();
+        ctx.translate(currentWidth / 2, currentHeight / 2);
+        ctx.rotate(-Math.PI / 2);
+        ctx.drawImage(video, -currentHeight / 2, -currentWidth / 2, currentHeight, currentWidth);
+        ctx.restore();
+      } else {
+        ctx.drawImage(video, 0, 0, currentWidth, currentHeight);
+      }
+      uploading = true;
+      let blob;
+      if (useWebP) {
+        blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/webp', 0.5));
+      } else {
+        blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.3));
+      }
+      if (!blob) {
+        status.textContent = 'No frame to send.';
+        uploading = false;
+        setTimeout(sendFrame, 100);
+        return;
+      }
+      try {
+        await fetch(SERVER_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: blob
+        });
+        status.textContent = 'Streaming...';
+        // FPS calculation
+        frameCount++;
+        const now = performance.now();
+        if (!lastFrameTime) lastFrameTime = now;
+        if (now - lastFrameTime >= 1000) {
+          fpsDisplay.textContent = `FPS: ${frameCount}`;
+          frameCount = 0;
+          lastFrameTime = now;
+        }
+      } catch (e) {
+        status.textContent = 'Failed to send frame.';
+      }
+      uploading = false;
+      if (streaming) sendFrame();
+    }
+
+    resolutionSelect.onchange = async () => {
+      if (streaming) {
+        streaming = false;
+        startBtn.textContent = 'Start Streaming';
+        status.textContent = 'Restarting camera...';
+        await startCamera();
+        streaming = true;
+        startBtn.textContent = 'Stop Streaming';
+        sendFrame();
+      }
+    };
+
+    cameraSelect.onchange = async () => {
+      if (streaming) {
+        streaming = false;
+        startBtn.textContent = 'Start Streaming';
+        status.textContent = 'Restarting camera...';
+        await startCamera();
+        streaming = true;
+        startBtn.textContent = 'Stop Streaming';
+        sendFrame();
+      }
+    };
+    
+    startBtn.onclick = async () => {
+      if (!streaming) {
+        // Add touch event handler for iOS
+        startBtn.addEventListener('touchend', (e) => e.preventDefault(), { passive: false });
+        
+        // Clear any existing streams
+        if (video.srcObject) {
+          video.srcObject.getTracks().forEach(track => track.stop());
+        }
+        
+        if (!cameraStarted) {
+          status.textContent = 'Requesting camera access...';
+          await startCamera();
+          if (!cameraStarted) {
+            // On iOS, provide specific instructions
+            if (/iPad|iPhone|iPod/.test(navigator.userAgent)) {
+              alert('Camera access is required. Please check:\n\n1. Safari Settings > Camera Access\n2. Privacy Settings > Camera\n3. Reload the page after enabling');
+            }
+            return;
+          }
+        }
+        streaming = true;
+        startBtn.textContent = 'Stop Streaming';
+        
+        // Request wake lock when streaming starts
+        await requestWakeLock();
+        
+        // Set up auto-reconnect monitoring
+        streamReconnectAttempts = 0;
+        if (reconnectTimer) clearInterval(reconnectTimer);
+        reconnectTimer = setInterval(async () => {
+          if (streaming && !cameraStarted && streamReconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+            streamReconnectAttempts++;
+            status.textContent = `Attempting to reconnect... (${streamReconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`;
+            await startCamera();
+            if (cameraStarted) {
+              streamReconnectAttempts = 0;
+              status.textContent = 'Camera reconnected successfully.';
+            }
+          } else if (streamReconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            status.textContent = 'Max reconnection attempts reached. Please restart streaming.';
+            streaming = false;
+            startBtn.textContent = 'Start Streaming';
+            clearInterval(reconnectTimer);
+          }
+        }, 5000);  // Check every 5 seconds
+
+        sendFrame();
+        if (!fpsTimer) {
+          fpsTimer = setInterval(() => {
+            fpsDisplay.textContent = `FPS: ${frameCount}`;
+            frameCount = 0;
+          }, 1000);
+        }      
+      } else {
+        streaming = false;
+        startBtn.textContent = 'Start Streaming';
+        status.textContent = 'Stopped.';
+        
+        // Release wake lock when stopping
+        await releaseWakeLock();
+        
+        // Clear reconnect timer
+        if (reconnectTimer) {
+            clearInterval(reconnectTimer);
+            reconnectTimer = null;
+        }
+        
+        if (fpsTimer) {
+          clearInterval(fpsTimer);
+          fpsTimer = null;
+        }
+        fpsDisplay.textContent = '';
+      }
+    };
+
+    // On load, check for WebP support
+    (async () => {
+      useWebP = await checkWebPSupport();
+    })();
+  </script>
+</body>
+</html>
