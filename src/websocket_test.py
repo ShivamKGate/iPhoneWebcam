@@ -1,46 +1,29 @@
 import cv2
 import numpy as np
 import pyvirtualcam
-from flask import Flask, render_template, request, Response
+from flask import Flask, render_template
+from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 import threading
 import queue
 import logging
 import os
+import base64
+import re
 
-# Configure logging first
+# Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Configure Flask logger
-werkzeug_logger = logging.getLogger('werkzeug')
-werkzeug_logger.setLevel(logging.DEBUG)
-
-# Setup Flask app
+# Setup Flask and SocketIO
 template_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'templates'))
 app = Flask(__name__, template_folder=template_dir)
-CORS(app, resources={r"/*": {"origins": "*", "allow_headers": "*", "expose_headers": "*"}})
-
-# Add CORS headers to all responses
-@app.after_request
-def after_request(response):
-    # CORS headers
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
-    response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-    
-    # iOS-specific headers
-    response.headers.add('Cache-Control', 'no-cache, no-store, must-revalidate')
-    response.headers.add('Pragma', 'no-cache')
-    response.headers.add('Expires', '0')
-    response.headers.add('X-Frame-Options', 'ALLOWALL')
-    response.headers.add('Cross-Origin-Resource-Policy', 'cross-origin')
-    response.headers.add('Cross-Origin-Embedder-Policy', 'credentialless')
-    
-    return response
+app.config['SECRET_KEY'] = 'secret!'
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 logger.info(f"Using template directory: {template_dir}")
 

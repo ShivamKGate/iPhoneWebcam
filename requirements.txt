@@ -1,7 +1,10 @@
 opencv-python
 pyvirtualcam
-requests
 numpy
 flask
 flask-cors
+flask-socketio
+simple-websocket
 netifaces
+qrcode
+pillow
